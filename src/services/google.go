@@ -2,11 +2,14 @@ package services
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"net/url"
+	"os"
+	"strconv"
 
 	"github.com/rudraptpsingh/gmail-scan/src/logger"
 	"github.com/spf13/viper"
@@ -44,11 +47,31 @@ var (
 	oauthStateStringGl = ""
 )
 
+var storeDir = "attachments/"
+
 type httpRWGMail struct {
 	token *oauth2.Token
 	ctx   context.Context
 	w     http.ResponseWriter
 	r     *http.Request
+	svc   *gmail.Service
+	user  string
+}
+
+type attachment struct {
+	filename string
+	id       string
+}
+
+type message struct {
+	size        int64
+	messageId   string
+	to          string
+	from        string
+	subject     string
+	date        string
+	body        string
+	attachments []attachment
 }
 
 /*
@@ -74,9 +97,9 @@ func CallBackFromGoogle(w http.ResponseWriter, r *http.Request) {
 	logger.Log.Info("Callback-gl..")
 
 	state := r.FormValue("state")
-	logger.Log.Info(state)
+	logger.Log.Debug(state)
 	if state != oauthStateStringGl {
-		logger.Log.Info("invalid oauth state, expected " + oauthStateStringGl + ", got " + state + "\n")
+		logger.Log.Error("invalid oauth state, expected " + oauthStateStringGl + ", got " + state + "\n")
 		http.Redirect(w, r, "/", http.StatusTemporaryRedirect)
 		return
 	}
@@ -100,25 +123,33 @@ func CallBackFromGoogle(w http.ResponseWriter, r *http.Request) {
 			logger.Log.Error("oauthConfGl.Exchange() failed with " + err.Error() + "\n")
 			return
 		}
-		logger.Log.Info("TOKEN>> AccessToken>> " + token.AccessToken)
-		logger.Log.Info("TOKEN>> Expiration Time>> " + token.Expiry.String())
-		logger.Log.Info("TOKEN>> RefreshToken>> " + token.RefreshToken)
-		logger.Log.Info("TOKEN>> TokenType>> " + token.TokenType)
+		logger.Log.Debug("TOKEN>> AccessToken>> " + token.AccessToken)
+		logger.Log.Debug("TOKEN>> Expiration Time>> " + token.Expiry.String())
+		logger.Log.Debug("TOKEN>> RefreshToken>> " + token.RefreshToken)
+		logger.Log.Debug("TOKEN>> TokenType>> " + token.TokenType)
 
+		var tokenSource = oauthConfGl.TokenSource(ctx, token)
+		user := "me"
+		svc, err := gmail.NewService(ctx, option.WithTokenSource(tokenSource))
+		if err != nil {
+			log.Fatal("failed to receive gmail client", err.Error())
+		}
 		rwGmail := &httpRWGMail{
 			token: token,
 			ctx:   ctx,
 			w:     w,
 			r:     r,
+			svc:   svc,
+			user:  user,
 		}
 
 		rwGmail.GetUserInfo()
-		rwGmail.GetMails()
+		rwGmail.GetMails("from: customercare@icicibank.com newer_than:10d")
 	}
 }
 
 func (h *httpRWGMail) GetUserInfo() {
-
+	h.w.Write([]byte("\nGetting user info\n"))
 	resp, err := http.Get("https://www.googleapis.com/oauth2/v2/userinfo?access_token=" + url.QueryEscape(h.token.AccessToken))
 	if err != nil {
 		logger.Log.Error("Get: " + err.Error() + "\n")
@@ -134,39 +165,145 @@ func (h *httpRWGMail) GetUserInfo() {
 		return
 	}
 
-	logger.Log.Info("parseResponseBody: " + string(response) + "\n")
-
-	h.w.Write([]byte("Hello, I'm protected\n"))
+	logger.Log.Debug("parseResponseBody: " + string(response) + "\n")
 	h.w.Write([]byte(string(response)))
 }
 
-func (h *httpRWGMail) GetMails() {
+func (h *httpRWGMail) GetMails(queryStr string) {
+	h.w.Write([]byte("\nGetting filtered mails with query: " + queryStr + "\n"))
+	var total int64
+	msgs := []message{}
+	pageToken := ""
+	for {
+		req := h.svc.Users.Messages.List(h.user).Q(queryStr)
+		if pageToken != "" {
+			req.PageToken(pageToken)
+		}
 
-	var tokenSource = oauthConfGl.TokenSource(h.ctx, h.token)
-	srv, err := gmail.NewService(h.ctx, option.WithTokenSource(tokenSource))
+		r, err := req.Do()
+		if err != nil {
+			logger.Log.Fatal("Failed to retrieve messages: " + err.Error() + "\n")
+		}
+
+		logger.Log.Info("Processing total Messages: " + strconv.Itoa(len(r.Messages)))
+		for _, m := range r.Messages {
+			var currMsg message
+			msg, err := h.svc.Users.Messages.Get(h.user, m.Id).Do()
+			if err != nil {
+				logger.Log.Fatal("Failed to retrieve message id: " + string(m.Id) + " " + err.Error() + "\n")
+			}
+
+			total += msg.SizeEstimate
+			currMsg.messageId = msg.Id
+			currMsg.size = msg.SizeEstimate
+			for _, h := range msg.Payload.Headers {
+				if h.Name == "Date" {
+					currMsg.date = h.Value
+				}
+
+				if h.Name == "Subject" {
+					currMsg.subject = h.Value
+					break
+				}
+
+				if h.Name == "To" {
+					currMsg.to = h.Value
+					break
+				}
+
+				if h.Name == "From" {
+					currMsg.from = h.Value
+					break
+				}
+			}
+
+			for _, part := range msg.Payload.Parts {
+				if part.MimeType == "multipart/alternative" {
+					for _, l := range part.Parts {
+						if l.MimeType == "text/plain" && l.Body.Size >= 1 {
+							currMsg.body, err = decodeEmailBody(l.Body.Data)
+							if err != nil {
+								logger.Log.Error("Failed to decode email body: " + err.Error() + "\n")
+								return
+							}
+						}
+
+						if l.MimeType == "text/html" && l.Body.Size >= 1 {
+							currMsg.body, err = decodeEmailBody(l.Body.Data)
+							if err != nil {
+								logger.Log.Error("Failed to decode email body: " + err.Error() + "\n")
+								return
+							}
+						}
+					}
+				}
+
+				if part.MimeType == "text/plain" && part.Body.Size >= 1 {
+					currMsg.body, err = decodeEmailBody(part.Body.Data)
+					if err != nil {
+						logger.Log.Error("Failed to decode email body: " + err.Error() + "\n")
+						return
+					}
+				}
+
+				if part.MimeType == "text/html" && part.Body.Size >= 1 {
+					currMsg.body, err = decodeEmailBody(part.Body.Data)
+					if err != nil {
+						logger.Log.Error("Failed to decode email body: " + err.Error() + "\n")
+						return
+					}
+				}
+
+				if part.Filename != "" {
+					if part.Body.AttachmentId != "" {
+						currMsg.attachments = append(currMsg.attachments, attachment{filename: part.Filename, id: part.Body.AttachmentId})
+						attachment, err := h.svc.Users.Messages.Attachments.Get(h.user, msg.Id, part.Body.AttachmentId).Do()
+						if err != nil {
+							logger.Log.Error("Error fetching attachment: " + err.Error() + "\n")
+							return
+						}
+						fileData, err := base64.URLEncoding.DecodeString(attachment.Data)
+						if err != nil {
+							logger.Log.Error("Error decoding attachment data: " + err.Error() + "\n")
+							return
+						}
+
+						err = os.MkdirAll(storeDir+currMsg.date, 0700)
+						if err != nil {
+							logger.Log.Error("Error creating directory: " + err.Error() + "\n")
+							return
+						}
+
+						path := storeDir + currMsg.date + "/" + part.Filename
+						err = os.WriteFile(path, fileData, 0644)
+						if err != nil {
+							logger.Log.Error("Error writing attachment to file: " + err.Error() + "\n")
+							return
+						}
+					}
+				}
+			}
+
+			msgs = append(msgs, currMsg)
+		}
+
+		if r.NextPageToken == "" {
+			break
+		}
+		pageToken = r.NextPageToken
+	}
+
+	for _, m := range msgs {
+		fmt.Println(m.attachments)
+		h.w.Write([]byte("\n-------------------------------------------------------------\n"))
+		h.w.Write([]byte(m.body))
+	}
+}
+
+func decodeEmailBody(data string) (string, error) {
+	decoded, err := base64.URLEncoding.DecodeString(data)
 	if err != nil {
-		log.Fatal("failed to receive gmail client", err.Error())
+		return "", err
 	}
-
-	user := "me"
-	messageList, err := srv.Users.Messages.List(user).Do()
-	if err != nil {
-		log.Fatalf("Unable to retrieve messages: %v", err)
-	}
-
-	if len(messageList.Messages) == 0 {
-		fmt.Println("No messages found.")
-		return
-	}
-
-	h.w.Write([]byte("Fetching message from id: " + messageList.Messages[0].Id))
-	message, err := srv.Users.Messages.Get(user, messageList.Messages[0].Id).Do()
-	if err != nil {
-		log.Fatalf("Unable to retrieve message %v", err)
-	}
-
-	fmt.Println(message.InternalDate)
-	fmt.Println(message.Payload.Body)
-
-	return
+	return string(decoded), nil
 }
