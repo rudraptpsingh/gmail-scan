@@ -15,6 +15,8 @@ func InitializeViper() {
 
 	// Set the path to look for the configurations file
 	viper.AddConfigPath(".")
+	viper.AddConfigPath("../")
+	viper.AddConfigPath("../../")
 
 	// Enable VIPER to read Environment Variables
 	viper.AutomaticEnv()

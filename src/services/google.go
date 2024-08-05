@@ -3,13 +3,17 @@ package services
 import (
 	"context"
 	"encoding/base64"
+	"encoding/csv"
 	"fmt"
 	"io"
 	"log"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
 
 	"github.com/rudraptpsingh/gmail-scan/src/logger"
 	"github.com/spf13/viper"
@@ -48,6 +52,7 @@ var (
 )
 
 var storeDir = "attachments/"
+var OAuthch chan *httpRWGMail
 
 type httpRWGMail struct {
 	token *oauth2.Token
@@ -72,6 +77,14 @@ type message struct {
 	date        string
 	body        string
 	attachments []attachment
+	unsubLink   string
+}
+
+func (m *message) GetAllAttachmentNames() (attachments []string) {
+	for _, at := range m.attachments {
+		attachments = append(attachments, at.filename)
+	}
+	return
 }
 
 /*
@@ -105,7 +118,6 @@ func CallBackFromGoogle(w http.ResponseWriter, r *http.Request) {
 	}
 
 	code := r.FormValue("code")
-	logger.Log.Info(code)
 
 	if code == "" {
 		logger.Log.Warn("Code not found..")
@@ -144,7 +156,20 @@ func CallBackFromGoogle(w http.ResponseWriter, r *http.Request) {
 		}
 
 		rwGmail.GetUserInfo()
-		rwGmail.GetMails("from: customercare@icicibank.com newer_than:10d")
+		//rwGmail.GetMails("from: customercare@icicibank.com newer_than:10d")
+		rwGmail.GetUnsubscribeList()
+
+		// var msg message
+		// msg.to = "rudra.ptp.singh@gmail.com"
+		// msg.subject = "Test mail from RP"
+		// msg.body = "Test Body from RP"
+		// msg.attachments = append(msg.attachments, attachment{
+		// 	filename: "/Users/rp/Documents/GitHub/gmail-scan/src/services/TestMail1.txt",
+		// })
+		// msg.attachments = append(msg.attachments, attachment{
+		// 	filename: "/Users/rp/Documents/GitHub/gmail-scan/src/services/TestMail2.txt",
+		// })
+		// rwGmail.SendMail(msg)
 	}
 }
 
@@ -194,96 +219,7 @@ func (h *httpRWGMail) GetMails(queryStr string) {
 			}
 
 			total += msg.SizeEstimate
-			currMsg.messageId = msg.Id
-			currMsg.size = msg.SizeEstimate
-			for _, h := range msg.Payload.Headers {
-				if h.Name == "Date" {
-					currMsg.date = h.Value
-				}
-
-				if h.Name == "Subject" {
-					currMsg.subject = h.Value
-					break
-				}
-
-				if h.Name == "To" {
-					currMsg.to = h.Value
-					break
-				}
-
-				if h.Name == "From" {
-					currMsg.from = h.Value
-					break
-				}
-			}
-
-			for _, part := range msg.Payload.Parts {
-				if part.MimeType == "multipart/alternative" {
-					for _, l := range part.Parts {
-						if l.MimeType == "text/plain" && l.Body.Size >= 1 {
-							currMsg.body, err = decodeEmailBody(l.Body.Data)
-							if err != nil {
-								logger.Log.Error("Failed to decode email body: " + err.Error() + "\n")
-								return
-							}
-						}
-
-						if l.MimeType == "text/html" && l.Body.Size >= 1 {
-							currMsg.body, err = decodeEmailBody(l.Body.Data)
-							if err != nil {
-								logger.Log.Error("Failed to decode email body: " + err.Error() + "\n")
-								return
-							}
-						}
-					}
-				}
-
-				if part.MimeType == "text/plain" && part.Body.Size >= 1 {
-					currMsg.body, err = decodeEmailBody(part.Body.Data)
-					if err != nil {
-						logger.Log.Error("Failed to decode email body: " + err.Error() + "\n")
-						return
-					}
-				}
-
-				if part.MimeType == "text/html" && part.Body.Size >= 1 {
-					currMsg.body, err = decodeEmailBody(part.Body.Data)
-					if err != nil {
-						logger.Log.Error("Failed to decode email body: " + err.Error() + "\n")
-						return
-					}
-				}
-
-				if part.Filename != "" {
-					if part.Body.AttachmentId != "" {
-						currMsg.attachments = append(currMsg.attachments, attachment{filename: part.Filename, id: part.Body.AttachmentId})
-						attachment, err := h.svc.Users.Messages.Attachments.Get(h.user, msg.Id, part.Body.AttachmentId).Do()
-						if err != nil {
-							logger.Log.Error("Error fetching attachment: " + err.Error() + "\n")
-							return
-						}
-						fileData, err := base64.URLEncoding.DecodeString(attachment.Data)
-						if err != nil {
-							logger.Log.Error("Error decoding attachment data: " + err.Error() + "\n")
-							return
-						}
-
-						err = os.MkdirAll(storeDir+currMsg.date, 0700)
-						if err != nil {
-							logger.Log.Error("Error creating directory: " + err.Error() + "\n")
-							return
-						}
-
-						path := storeDir + currMsg.date + "/" + part.Filename
-						err = os.WriteFile(path, fileData, 0644)
-						if err != nil {
-							logger.Log.Error("Error writing attachment to file: " + err.Error() + "\n")
-							return
-						}
-					}
-				}
-			}
-
+			currMsg = h.GetMsgDetails(msg)
 			msgs = append(msgs, currMsg)
 		}
 
@@ -306,4 +242,235 @@ func decodeEmailBody(data string) (string, error) {
 		return "", err
 	}
 	return string(decoded), nil
+}
+
+func (h *httpRWGMail) GetUnsubscribeList() {
+	pageToken := ""
+	var unsubList []string
+	unsubFile, err := os.Create("unsublist.csv")
+	defer unsubFile.Close()
+	// initialize csv writer
+	writer := csv.NewWriter(unsubFile)
+	writer.Write([]string{"Unsubscribe link", "Email body"})
+	defer writer.Flush()
+	if err != nil {
+		logger.Log.Error("Failed to create excel file to save unsubscribe list")
+	}
+
+	for {
+		req := h.svc.Users.Messages.List(h.user)
+		if pageToken != "" {
+			req.PageToken(pageToken)
+		}
+
+		resp, err := req.Do()
+		if err != nil {
+			logger.Log.Error("Error fetching messages: " + err.Error() + "\n")
+			return
+		}
+
+		logger.Log.Info("Processing total Messages: " + strconv.Itoa(len(resp.Messages)))
+		for _, m := range resp.Messages {
+			msg, err := h.svc.Users.Messages.Get(h.user, m.Id).Do()
+			if err != nil {
+				logger.Log.Error("Error fetching message: " + err.Error() + "\n")
+				return
+			}
+
+			for _, header := range msg.Payload.Headers {
+				if header.Name == "List-Unsubscribe" {
+					body, err := GetEmailBodyFromMsg(msg)
+					if err != nil || body == "" {
+						logger.Log.Info("Failed to get email body from msg\n")
+						continue
+					}
+
+					unsubLink, err := extractUnsubscribeLink(body)
+					if err == nil {
+						logger.Log.Debug("Extracted Link. " + "\n" + "Body: " + body + "\n" + "Unsubscribe link: " + unsubLink + "\n")
+						unsubList = append(unsubList, unsubLink)
+						h.w.Write([]byte("\n-------------------------------------------------------------\n"))
+						h.w.Write([]byte("Unsubscribe Link: " + unsubLink))
+						h.w.Write([]byte("\n-------------------------------------------------------------\n"))
+					} else {
+						logger.Log.Debug("Can't extract link. Body: " + body)
+						writer.Write([]string{unsubLink, body})
+					}
+				}
+			}
+
+			if resp.NextPageToken == "" {
+				break
+			}
+			pageToken = resp.NextPageToken
+		}
+	}
+}
+
+func (h *httpRWGMail) GetMsgDetails(msg *gmail.Message) (currMsg message) {
+	currMsg.messageId = msg.Id
+	currMsg.size = msg.SizeEstimate
+	for _, h := range msg.Payload.Headers {
+		if h.Name == "Date" {
+			currMsg.date = h.Value
+			break
+		}
+
+		if h.Name == "Subject" {
+			currMsg.subject = h.Value
+			break
+		}
+
+		if h.Name == "To" {
+			currMsg.to = h.Value
+			break
+		}
+
+		if h.Name == "From" {
+			currMsg.from = h.Value
+			break
+		}
+
+		if h.Name == "List-Unsubscribe" {
+			currMsg.unsubLink = h.Value
+		}
+	}
+
+	body, err := GetEmailBodyFromMsg(msg)
+	if err != nil {
+		logger.Log.Error("Failed to get email body from message" + err.Error() + "\n")
+	}
+
+	currMsg.body = body
+	currMsg.attachments, err = h.GetEmailAttachmentsFromMsg(msg)
+	if err != nil {
+		logger.Log.Error("Failed to get attachments from message" + "\n")
+	}
+
+	return
+}
+
+func (h *httpRWGMail) SendMail(msg message) (err error) {
+	logger.Log.Debug("Sending mail\n")
+	attachments := msg.GetAllAttachmentNames()
+	msgBody, err := createMessageWithAttachments(msg.to, msg.subject, msg.body, attachments)
+	if err != nil {
+		log.Fatalf("Unable to create message: %v", err)
+	}
+
+	_, err = h.svc.Users.Messages.Send(h.user, msgBody).Do()
+	if err != nil {
+		logger.Log.Error("Error sending mail" + err.Error() + "\n")
+		return
+	}
+
+	logger.Log.Debug("Mail sent successfully")
+	return
+}
+
+func createMessageWithAttachments(to, subject, body string, filenames []string) (msg *gmail.Message, err error) {
+	// Create a multipart writer
+	var buf strings.Builder
+	writer := multipart.NewWriter(&buf)
+	boundary := writer.Boundary()
+
+	// Write the email headers
+	headers := fmt.Sprintf("From: 'me'\r\nTo: %s\r\nSubject: %s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=%s\r\n\r\n", to, subject, boundary)
+	buf.WriteString(headers)
+
+	// Write the email body
+	part, err := writer.CreatePart(map[string][]string{
+		"Content-Type": {"text/plain; charset=UTF-8"},
+	})
+	if err != nil {
+		return nil, err
+	}
+	part.Write([]byte(body))
+
+	for _, path := range filenames {
+		// Read the attachment file
+		file, err := os.Open(path)
+		if err != nil {
+			return nil, err
+		}
+		defer file.Close()
+
+		// Write the attachment
+		part, err = writer.CreatePart(map[string][]string{
+			"Content-Type":              {"application/octet-stream"},
+			"Content-Disposition":       {fmt.Sprintf("attachment; filename=\"%s\"", filepath.Base(path))},
+			"Content-Transfer-Encoding": {"base64"},
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		// Encode the file content to base64
+		fileContent := make([]byte, 4096)
+		for {
+			n, err := file.Read(fileContent)
+			if err != nil {
+				break
+			}
+			part.Write([]byte(base64.StdEncoding.EncodeToString(fileContent[:n])))
+		}
+	}
+
+	writer.Close()
+
+	// Encode the entire message to base64
+	rawMessage := base64.URLEncoding.EncodeToString([]byte(buf.String()))
+	msg = &gmail.Message{
+		Raw: rawMessage,
+	}
+
+	return
+}
+
+func InitGmailOAuthAndRunApp(port string) {
+	// Initialize Oauth2 Services
+	InitializeOAuthGoogle()
+
+	// Routes for the application
+	http.HandleFunc("/", HandleMain)
+	http.HandleFunc("/login-gmail", HandleGoogleLogin)
+	http.HandleFunc("/callback-gl", CallBackFromGoogle)
+
+	logger.Log.Info("Started running on http://localhost:" + port)
+	log.Fatal(http.ListenAndServe(":"+viper.GetString("port"), nil))
+}
+
+func (h *httpRWGMail) GetEmailAttachmentsFromMsg(msg *gmail.Message) (attachments []attachment, err error) {
+	for _, part := range msg.Payload.Parts {
+		if part.Filename != "" {
+			if part.Body.AttachmentId != "" {
+				attachments = append(attachments, attachment{filename: part.Filename, id: part.Body.AttachmentId})
+				at, err := h.svc.Users.Messages.Attachments.Get(h.user, msg.Id, part.Body.AttachmentId).Do()
+				if err != nil {
+					logger.Log.Error("Error fetching attachment: " + err.Error() + "\n")
+					break
+				}
+				fileData, err := base64.URLEncoding.DecodeString(at.Data)
+				if err != nil {
+					logger.Log.Error("Error decoding attachment data: " + err.Error() + "\n")
+					break
+				}
+
+				err = os.MkdirAll(storeDir, 0700)
+				if err != nil {
+					logger.Log.Error("Error creating directory: " + err.Error() + "\n")
+					break
+				}
+
+				path := storeDir + "/" + part.Filename
+				err = os.WriteFile(path, fileData, 0644)
+				if err != nil {
+					logger.Log.Error("Error writing attachment to file: " + err.Error() + "\n")
+					break
+				}
+			}
+		}
+	}
+
+	return
 }
